@@ -14,7 +14,7 @@ Unlike memory built into a single app, this memory belongs to you. It runs in yo
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/rahilp/second-brain-cloudflare)
 
-Deploying takes about two minutes. See the [Quick Start](#quick-start) for the required configuration values.
+Deploying takes about two minutes. See the [Quick Start](#quick-start) or the full [Deployment Guide (`DEPLOYMENT.md`)](DEPLOYMENT.md) for provisioning commands, environment variables, security checks, and MCP client configs.
 
 > ## #3 Product of the Day on Product Hunt
 >
@@ -233,6 +233,7 @@ npm run deploy
 
 ## Documentation
 
+* [Deployment Guide](DEPLOYMENT.md): Production provisioning (D1, KV, Vectorize, `AUTH_TOKEN`), verification commands, security hardening, and MCP client setup
 * [Setup Guide](../../wiki/Setup-Guide): Deploy the Worker, configure authentication, and connect AI clients
 * [How It Works](../../wiki/How-It-Works): Semantic search, chunking, memory classification, and duplicate detection
 * [Connect to AI Clients](../../wiki/Connect-to-AI-Clients): ChatGPT, Claude, Claude Code, Codex, and other MCP clients

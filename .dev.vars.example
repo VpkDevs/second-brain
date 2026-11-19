@@ -1,1 +1,22 @@
-AUTH_TOKEN=your_memorable_token_here
+# Second Brain — Local Cloudflare Worker development variables
+# Copy this file to `.dev.vars` for `npm run dev` (Wrangler loads `.dev.vars` automatically).
+# Never commit `.dev.vars` — it is listed in `.gitignore`.
+# For production deployments, set secrets via `npx wrangler secret put AUTH_TOKEN`.
+
+# REQUIRED: Bearer token / OAuth login password protecting all REST API, dashboard, and MCP routes.
+# Generate a strong secret with: openssl rand -base64 32
+AUTH_TOKEN=replace-with-a-strong-secret-token
+
+# OPTIONAL: Grace window (milliseconds) before newly captured entries without vectors
+# are flagged as unvectorized or retried by POST /vectorize-pending.
+# Defaults to "300000" (5 minutes) in wrangler.jsonc.
+# VECTORIZE_GRACE_MS=300000
+
+# ---------------------------------------------------------------------------
+# Cloudflare Bindings (configured in wrangler.jsonc, NOT in .dev.vars):
+#   DB         - D1 SQLite database (`second-brain-db`)
+#   VECTORIZE  - Vectorize index (`second-brain-vectors`, 384 dims, cosine)
+#   AI         - Workers AI binding (embeddings + LLM classification/synthesis)
+#   OAUTH_KV   - Workers KV namespace (OAuth client registrations/tokens + Notion integration state)
+#   ASSETS     - Static dashboard files in `./public`
+# ---------------------------------------------------------------------------

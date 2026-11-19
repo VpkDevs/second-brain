@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-RAW_BASE="https://raw.githubusercontent.com/rahilp/second-brain-cloudflare/main"
+RAW_BASE="${SECOND_BRAIN_RAW_BASE:-https://raw.githubusercontent.com/VpkDevs/second-brain/main}"
 START_MARKER="<!-- second-brain:instructions:start -->"
 END_MARKER="<!-- second-brain:instructions:end -->"
 SENTINEL_PHRASE="At the start of EVERY conversation, call recall"

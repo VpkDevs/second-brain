@@ -1,4 +1,4 @@
--- Run with: wrangler d1 execute second-brain-db --file=schema.sql
+-- Run with: wrangler d1 execute second-brain-db --file=db/schema.sql
 
 CREATE TABLE IF NOT EXISTS entries (
   id               TEXT PRIMARY KEY,

@@ -9,7 +9,8 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "second-brain-db","database_id": "2a30b902-a2a3-41d9-b217-3da2b046ac27"
+			"database_name": "second-brain-db",
+			"database_id": "2a30b902-a2a3-41d9-b217-3da2b046ac27"
 		}
 	],
 	"vectorize": [
@@ -23,14 +24,17 @@
 	},
 	"kv_namespaces": [
 		{
-			"binding": "OAUTH_KV","id": "058a6de4ffb140208fb07b2c42fb366a"
+			"binding": "OAUTH_KV",
+			"id": "058a6de4ffb140208fb07b2c42fb366a"
 		}
 	],
 	"vars": {
 		"VECTORIZE_GRACE_MS": "300000"
 	},
 	"secrets": {
-		"required": ["AUTH_TOKEN"]
+		"required": [
+			"AUTH_TOKEN"
+		]
 	},
 	"assets": {
 		"directory": "./public"

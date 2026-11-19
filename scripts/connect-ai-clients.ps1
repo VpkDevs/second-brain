@@ -14,7 +14,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$RawBase = "https://raw.githubusercontent.com/rahilp/second-brain-cloudflare/main"
+$RawBase = if ($env:SECOND_BRAIN_RAW_BASE) { $env:SECOND_BRAIN_RAW_BASE } else { "https://raw.githubusercontent.com/VpkDevs/second-brain/main" }
 $StartMarker = "<!-- second-brain:instructions:start -->"
 $EndMarker = "<!-- second-brain:instructions:end -->"
 $SentinelPhrase = "At the start of EVERY conversation, call recall"

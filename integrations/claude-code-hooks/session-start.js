@@ -14,7 +14,7 @@ async function main() {
   let data;
   try {
     const url = new URL('/recall', baseUrl);
-    url.searchParams.set('q', query);
+    url.searchParams.set('query', query);
     url.searchParams.set('topK', '5');
     const res = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${token}` },

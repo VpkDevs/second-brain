@@ -26,13 +26,32 @@ export interface Env extends Omit<Cloudflare.Env, "VECTORIZE_GRACE_MS"> {
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
+// ─── CORS & Security Headers ──────────────────────────────────────────────────
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
 };
+
+export const SECURITY_HEADERS: Record<string, string> = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+};
+
+function withSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
+    if (!headers.has(key)) headers.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 function graceMs(env: Env): number {
   return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
@@ -558,23 +577,90 @@ async function readStreamText(stream: ReadableStream): Promise<string> {
   return text;
 }
 
+export function getConfiguredAuthToken(env: Env): string | null {
+  if (typeof env.AUTH_TOKEN !== "string" || env.AUTH_TOKEN.trim().length === 0) {
+    return null;
+  }
+  return env.AUTH_TOKEN;
+}
+
+export function timingSafeEqualStrings(a: string, b: string): boolean {
+  const enc = new TextEncoder();
+  const aBytes = enc.encode(a);
+  const bBytes = enc.encode(b);
+  const maxLen = Math.max(aBytes.length, bBytes.length);
+  let diff = aBytes.length ^ bBytes.length;
+  for (let i = 0; i < maxLen; i++) {
+    diff |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0);
+  }
+  return diff === 0;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function parseJsonBody<T extends Record<string, unknown>>(request: Request): Promise<T | null> {
+  try {
+    const parsed: unknown = await request.json();
+    if (!isRecord(parsed)) return null;
+    return parsed as T;
+  } catch {
+    return null;
+  }
+}
+
+function parseIntParam(value: string | null, fallback: number, min: number, max: number): number {
+  if (value === null) return fallback;
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+}
+
+function parseOptionalIntParam(value: string | null): number | undefined {
+  if (value === null || value.trim() === "") return undefined;
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function isAuthorized(request: Request, env: Env): boolean {
-  if (request.headers.get("Authorization") === `Bearer ${env.AUTH_TOKEN}`) return true;
-  return new URL(request.url).searchParams.get("token") === env.AUTH_TOKEN;
+  const expected = getConfiguredAuthToken(env);
+  if (!expected) return false;
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    const provided = authHeader.slice("Bearer ".length);
+    if (timingSafeEqualStrings(provided, expected)) return true;
+  }
+  const queryToken = new URL(request.url).searchParams.get("token");
+  if (queryToken !== null && timingSafeEqualStrings(queryToken, expected)) return true;
+  return false;
 }
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS, ...SECURITY_HEADERS },
   });
 }
 
-// Returns a 401 Response if the request lacks a valid token, otherwise null —
-// lets routes early-return with `const authErr = requireAuth(...); if (authErr) return authErr;`
+// Returns a 503 if AUTH_TOKEN is not configured, a 401 if the request lacks a valid token,
+// otherwise null — lets routes early-return with `const authErr = requireAuth(...); if (authErr) return authErr;`
 function requireAuth(request: Request, env: Env): Response | null {
+  if (!getConfiguredAuthToken(env)) {
+    return json({ ok: false, error: "Server misconfigured: AUTH_TOKEN secret is not configured" }, 503);
+  }
   if (isAuthorized(request, env)) return null;
   return json({ ok: false, error: "Unauthorized" }, 401);
+}
+
+function requireBinding(env: Env, binding: "DB" | "AI" | "OAUTH_KV"): Response | null {
+  if (env[binding]) return null;
+  return json({ ok: false, error: `Server misconfigured: ${binding} binding is not configured` }, 503);
 }
 
 // Hosted OAuth login page. Styled to match the dashboard's token-entry card
@@ -627,7 +713,7 @@ function loginHtml(error?: string): string {
       <input type="password" name="password" placeholder="Bearer token" autofocus autocomplete="current-password" />
       <button type="submit">Connect</button>
     </form>
-    <div class="auth-error">${error ? error : ""}</div>
+    <div class="auth-error">${error ? escapeHtml(error) : ""}</div>
   </div>
 </body>
 </html>`;
@@ -657,6 +743,13 @@ export interface VectorizeHealth {
 }
 
 export async function checkVectorizeHealth(env: Env): Promise<VectorizeHealth> {
+  if (!env.VECTORIZE) {
+    return {
+      ok: false,
+      indexName: VECTORIZE_INDEX_NAME,
+      error: "VECTORIZE binding is not configured",
+    };
+  }
   try {
     const info = (await env.VECTORIZE.describe()) as any;
     return {
@@ -676,6 +769,7 @@ export async function checkVectorizeHealth(env: Env): Promise<VectorizeHealth> {
 // ─── Database initialization ──────────────────────────────────────────────────
 
 async function initializeDatabase(env: Env): Promise<void> {
+  if (!env.DB) return;
   try {
     await env.DB.exec(`CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, content TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'api', created_at INTEGER NOT NULL, vector_ids TEXT NOT NULL DEFAULT '[]')`);
     await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_entries_created_at ON entries(created_at DESC)`);
@@ -2692,13 +2786,16 @@ export async function sanitizeToolsListResponse(response: Response): Promise<Res
 
 const apiHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const dbErr = requireBinding(env, "DB");
+    if (dbErr) return dbErr;
     if (!dbReady) {
       ctx.waitUntil(initializeDatabase(env).then(() => { dbReady = true; }));
     }
     const server = buildMcpServer(env, ctx);
     const isToolsList = await isMcpToolsListRequest(request);
     const response = await createMcpHandler(server)(request, env, ctx);
-    return isToolsList ? sanitizeToolsListResponse(response) : response;
+    const finalResponse = isToolsList ? await sanitizeToolsListResponse(response) : response;
+    return withSecurityHeaders(finalResponse);
   },
 };
 
@@ -2708,8 +2805,23 @@ const defaultHandler = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // GET /healthz — unauthenticated liveness probe for external uptime monitors.
+    // Deliberately returns only service status without leaking binding or index internals.
+    // Authenticated diagnostics (Vectorize + binding status) live at GET /health.
+    if (url.pathname === "/healthz" && request.method === "GET") {
+      return json({ ok: true, status: "ok", service: "second-brain" });
+    }
+
     // OAuth authorize endpoint — hosted login page for browser-based MCP clients.
     if (url.pathname === "/oauth/authorize") {
+      const oauthHeaders = { "Cache-Control": "no-store", ...SECURITY_HEADERS };
+      const expectedToken = getConfiguredAuthToken(env);
+      if (!expectedToken) {
+        return new Response(
+          "Server misconfigured: AUTH_TOKEN secret is not set. Configure it with `wrangler secret put AUTH_TOKEN`.",
+          { status: 503, headers: { "Content-Type": "text/plain", ...oauthHeaders } },
+        );
+      }
       let oauthReq: any;
       try {
         // workers-oauth-provider mis-parses POST bodies; pass a URL-only GET clone
@@ -2718,14 +2830,15 @@ const defaultHandler = {
         oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(parseReq);
       } catch {
         return new Response("Invalid authorization request — this page must be opened by an MCP client.", {
-          status: 400, headers: { "Content-Type": "text/plain" },
+          status: 400, headers: { "Content-Type": "text/plain", ...oauthHeaders },
         });
       }
       if (request.method === "POST") {
         const form = await request.formData();
-        if (form.get("password") !== env.AUTH_TOKEN) {
+        const password = form.get("password");
+        if (typeof password !== "string" || !timingSafeEqualStrings(password, expectedToken)) {
           return new Response(loginHtml("Invalid token"), {
-            status: 401, headers: { "Content-Type": "text/html" },
+            status: 401, headers: { "Content-Type": "text/html; charset=utf-8", ...oauthHeaders },
           });
         }
         const { redirectTo } = await (env as any).OAUTH_PROVIDER.completeAuthorization({
@@ -2736,29 +2849,33 @@ const defaultHandler = {
         });
         return Response.redirect(redirectTo, 302);
       }
-      return new Response(loginHtml(), { headers: { "Content-Type": "text/html" } });
+      return new Response(loginHtml(), { headers: { "Content-Type": "text/html; charset=utf-8", ...oauthHeaders } });
     }
 
-    if (!dbReady) {
+    if (!dbReady && env.DB) {
       ctx.waitUntil(
         initializeDatabase(env).then(() => { dbReady = true; })
       );
     }
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
+      return new Response(null, { headers: { ...CORS_HEADERS, ...SECURITY_HEADERS } });
     }
 
     // POST /capture
     if (url.pathname === "/capture" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { content?: string; tags?: string[]; source?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ content?: string; tags?: string[]; source?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.content?.trim()) return json({ ok: false, error: "content is required" }, 400);
 
-      const result = await captureEntry(body.content, body.tags ?? [], body.source ?? "api", env, ctx);
+      const tags = Array.isArray(body.tags) ? body.tags.filter((t): t is string => typeof t === "string") : [];
+      const source = typeof body.source === "string" && body.source.trim() ? body.source : "api";
+      const result = await captureEntry(body.content, tags, source, env, ctx);
 
       if (result.status === "blocked") {
         return json({
@@ -2798,9 +2915,11 @@ const defaultHandler = {
     if (url.pathname === "/append" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { id?: string; addition?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ id?: string; addition?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
       if (!body.addition?.trim()) return json({ ok: false, error: "addition is required" }, 400);
 
@@ -2840,9 +2959,11 @@ const defaultHandler = {
     if (url.pathname === "/update" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { id?: string; content?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ id?: string; content?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
       if (!body.content?.trim()) return json({ ok: false, error: "content is required" }, 400);
 
@@ -2890,6 +3011,8 @@ const defaultHandler = {
     if (url.pathname === "/count" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
       const row = await env.DB.prepare(`SELECT COUNT(*) as count FROM entries`).first() as Record<string, any> | null;
       return json({ count: (row?.count as number) ?? 0 });
     }
@@ -2898,6 +3021,8 @@ const defaultHandler = {
     if (url.pathname === "/tags" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
       const { results } = await env.DB.prepare(
         `SELECT DISTINCT value FROM entries, json_each(entries.tags) ORDER BY value`
       ).all();
@@ -2908,6 +3033,8 @@ const defaultHandler = {
     if (url.pathname === "/stats" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
       const graceCutoff = Date.now() - graceMs(env);
       const [summary, tagRows, candidateRows] = await Promise.all([
         env.DB.prepare(
@@ -2954,23 +3081,38 @@ const defaultHandler = {
       });
     }
 
-    // GET /health — index/runtime health, used by the dashboard banner, the
-    // README verify step, and external uptime checks.
+    // GET /health — authenticated index/runtime health, used by the dashboard banner
+    // and verified checks. Unauthenticated liveness lives at GET /healthz.
     if (url.pathname === "/health" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
       const vectorize = await checkVectorizeHealth(env);
-      return json({ ok: vectorize.ok, vectorize });
+      const bindings = {
+        db: Boolean(env.DB),
+        ai: Boolean(env.AI),
+        oauth_kv: Boolean(env.OAUTH_KV),
+        vectorize: Boolean(env.VECTORIZE),
+      };
+      const ok = vectorize.ok && bindings.db && bindings.ai && bindings.oauth_kv;
+      return json({
+        ok,
+        status: ok ? "ok" : "degraded",
+        service: "second-brain",
+        vectorize,
+        bindings,
+      });
     }
 
     // GET /list
     if (url.pathname === "/list" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
-      const n = Math.min(parseInt(url.searchParams.get("n") ?? "20", 10), 100);
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
+      const n = parseIntParam(url.searchParams.get("n"), 20, 1, 100);
       const tag = url.searchParams.get("tag")?.trim() || undefined;
-      const after = url.searchParams.has("after") ? parseInt(url.searchParams.get("after")!, 10) : undefined;
-      const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
+      const after = parseOptionalIntParam(url.searchParams.get("after"));
+      const before = parseOptionalIntParam(url.searchParams.get("before"));
 
       const { sql, bindings } = buildEntryFilterQuery({ n, tag, after, before });
       const { results } = await env.DB.prepare(sql).bind(...bindings).all();
@@ -2984,6 +3126,8 @@ const defaultHandler = {
     if (url.pathname === "/export" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const { results: entryRows } = await env.DB.prepare(
         `SELECT id, content, tags, source, created_at, recall_count, importance_score, contradiction_wins, contradiction_losses FROM entries ORDER BY created_at DESC`
@@ -3020,17 +3164,19 @@ const defaultHandler = {
     if (url.pathname === "/recall" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      const query = url.searchParams.get("query")?.trim();
+      const query = (url.searchParams.get("query") ?? url.searchParams.get("q"))?.trim();
       if (!query) return json({ ok: false, error: "query is required" }, 400);
 
-      const topK = Math.min(Math.max(parseInt(url.searchParams.get("topK") ?? "5", 10), 1), 20);
+      const topK = parseIntParam(url.searchParams.get("topK"), 5, 1, 20);
       const tag = url.searchParams.get("tag")?.trim() || undefined;
-      const after = url.searchParams.has("after") ? parseInt(url.searchParams.get("after")!, 10) : undefined;
-      const before = url.searchParams.has("before") ? parseInt(url.searchParams.get("before")!, 10) : undefined;
+      const after = parseOptionalIntParam(url.searchParams.get("after"));
+      const before = parseOptionalIntParam(url.searchParams.get("before"));
       const kindParam = url.searchParams.get("kind")?.trim();
       const kind = kindParam && (KIND_VALUES as readonly string[]).includes(kindParam) ? kindParam as MemoryKind : undefined;
-      const hops = Math.min(Math.max(parseInt(url.searchParams.get("hops") ?? "0", 10), 0), 3);
+      const hops = parseIntParam(url.searchParams.get("hops"), 0, 0, 3);
 
       const { matches, insight, semanticUnavailable } = await recallEntries({ query, topK, tag, after, before, kind, hops }, env, ctx);
 
@@ -3066,9 +3212,11 @@ const defaultHandler = {
     if (url.pathname === "/forget" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { id?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ id?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
 
       const id = body.id.trim();
@@ -3085,9 +3233,11 @@ const defaultHandler = {
     if (url.pathname === "/link" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { source_id?: string; target_id?: string; type?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ source_id?: string; target_id?: string; type?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       const sourceId = body.source_id?.trim();
       const targetId = body.target_id?.trim();
       if (!sourceId || !targetId) return json({ ok: false, error: "source_id and target_id are required" }, 400);
@@ -3107,9 +3257,11 @@ const defaultHandler = {
     if (url.pathname === "/unlink" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { source_id?: string; target_id?: string; type?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ source_id?: string; target_id?: string; type?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       const sourceId = body.source_id?.trim();
       const targetId = body.target_id?.trim();
       if (!sourceId || !targetId) return json({ ok: false, error: "source_id and target_id are required" }, 400);
@@ -3126,6 +3278,8 @@ const defaultHandler = {
     if (url.pathname === "/connections" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const id = url.searchParams.get("id")?.trim();
       if (!id) return json({ ok: false, error: "id is required" }, 400);
@@ -3141,6 +3295,8 @@ const defaultHandler = {
     if (url.pathname === "/entry" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const id = url.searchParams.get("id")?.trim();
       if (!id) return json({ ok: false, error: "id is required" }, 400);
@@ -3167,10 +3323,11 @@ const defaultHandler = {
     if (url.pathname === "/graph" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const seed = url.searchParams.get("seed")?.trim() || undefined;
-      const limitParam = url.searchParams.get("limit");
-      const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+      const limit = parseOptionalIntParam(url.searchParams.get("limit"));
 
       const { nodes, edges } = await buildGraph({ seed, limit }, env);
       return json({ ok: true, nodes, edges });
@@ -3180,9 +3337,11 @@ const defaultHandler = {
     if (url.pathname === "/status" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { id?: string; status?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ id?: string; status?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.id?.trim()) return json({ ok: false, error: "id is required" }, 400);
       if (!(STATUS_VALUES as readonly string[]).includes(body.status ?? "")) {
         return json({ ok: false, error: `status must be one of: ${STATUS_VALUES.join(", ")}` }, 400);
@@ -3206,9 +3365,11 @@ const defaultHandler = {
     if (url.pathname === "/patterns/resolve" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
-      let body: { id?: string; action?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ id?: string; action?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       const id = body.id?.trim();
       if (!id) return json({ ok: false, error: "id is required" }, 400);
       const action = body.action;
@@ -3240,9 +3401,11 @@ const defaultHandler = {
     if (url.pathname === "/chat" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const aiErr = requireBinding(env, "AI");
+      if (aiErr) return aiErr;
 
-      let body: { query?: string; memories?: string };
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      const body = await parseJsonBody<{ query?: string; memories?: string }>(request);
+      if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
       if (!body.query?.trim()) return json({ ok: false, error: "query is required" }, 400);
 
       const systemPrompt = `You are a personal memory assistant. Answer the user's question using ONLY the memories provided. Even if the match scores are low, extract any relevant facts and answer directly. Never say you don't have enough information if the answer exists anywhere in the memories. Be concise.`;
@@ -3259,7 +3422,7 @@ const defaultHandler = {
       });
 
       return new Response(stream as ReadableStream, {
-        headers: { "Content-Type": "text/event-stream", ...CORS_HEADERS },
+        headers: { "Content-Type": "text/event-stream", ...CORS_HEADERS, ...SECURITY_HEADERS },
       });
     }
 
@@ -3267,6 +3430,8 @@ const defaultHandler = {
     if (url.pathname === "/digest" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
       const tag = url.searchParams.get("tag")?.trim();
       if (!tag) return json({ ok: false, error: "tag parameter is required" }, 400);
 
@@ -3283,6 +3448,8 @@ const defaultHandler = {
     if (url.pathname === "/vectorize-pending" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const graceCutoff = Date.now() - graceMs(env);
 
@@ -3330,6 +3497,8 @@ const defaultHandler = {
     if (url.pathname === "/integrations" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const kvErr = requireBinding(env, "OAUTH_KV");
+      if (kvErr) return kvErr;
       const integrations = [];
       for (const provider of Object.values(INTEGRATION_PROVIDERS)) {
         integrations.push(integrationStatus(provider, await loadIntegration(env, provider.id)));
@@ -3342,6 +3511,8 @@ const defaultHandler = {
     if (integrationRoute && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const kvErr = requireBinding(env, "OAUTH_KV");
+      if (kvErr) return kvErr;
       const provider = getProvider(integrationRoute[1]);
       if (!provider) return json({ ok: false, error: `Unknown integration: ${integrationRoute[1]}` }, 404);
       const action = integrationRoute[2];
@@ -3350,8 +3521,8 @@ const defaultHandler = {
       // (server-side; the browser can't for CORS reasons) and store it only if
       // it works.
       if (action === "connect") {
-        let body: { token?: string };
-        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+        const body = await parseJsonBody<{ token?: string }>(request);
+        if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
         const token = body.token?.trim();
         if (!token) return json({ ok: false, error: "token is required" }, 400);
 
@@ -3386,6 +3557,8 @@ const defaultHandler = {
       // sync — one bounded batch; callers loop while `remaining` > 0 (same
       // pattern as POST /vectorize-pending).
       if (action === "sync") {
+        const dbErr = requireBinding(env, "DB");
+        if (dbErr) return dbErr;
         if (!(await loadIntegration(env, provider.id))) {
           return json({ ok: false, error: `${provider.name} is not connected` }, 404);
         }
@@ -3395,13 +3568,14 @@ const defaultHandler = {
 
       // disconnect — remove the connection. Mirrored memories are kept
       // (they're the user's data) unless purge=true.
-      let body: { purge?: boolean } = {};
-      try { body = await request.json(); } catch { /* empty body — keep memories */ }
+      const body = (await parseJsonBody<{ purge?: boolean }>(request)) ?? {};
       const record = await loadIntegration(env, provider.id);
       if (!record) return json({ ok: false, error: `${provider.name} is not connected` }, 404);
 
       let purged = 0;
       if (body.purge) {
+        const dbErr = requireBinding(env, "DB");
+        if (dbErr) return dbErr;
         for (const mapped of Object.values(record.itemMap)) {
           try {
             const r = await forgetEntry(mapped.entryId, env);
@@ -3423,6 +3597,8 @@ const defaultHandler = {
     if (url.pathname === "/classify-pending" && request.method === "POST") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const dbErr = requireBinding(env, "DB");
+      if (dbErr) return dbErr;
 
       const UNCLASSIFIED_WHERE = `tags NOT LIKE '%"status:%' AND tags NOT LIKE '%"kind:%'`;
 
@@ -3456,7 +3632,7 @@ const defaultHandler = {
       return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response("Not found", { status: 404, headers: { ...SECURITY_HEADERS } });
   },
 };
 
@@ -3474,7 +3650,8 @@ const oauthProvider = new OAuthProvider({
   clientRegistrationEndpoint: "/oauth/register",
   // Accept the static AUTH_TOKEN for Claude Desktop + mcp-remote (no browser flow).
   resolveExternalToken: async ({ token, env }) => {
-    if (token === (env as Env).AUTH_TOKEN) {
+    const expected = getConfiguredAuthToken(env as Env);
+    if (expected && typeof token === "string" && timingSafeEqualStrings(token, expected)) {
       return { props: { userId: "owner" } };
     }
     return null;
@@ -3485,8 +3662,14 @@ export default {
   fetch: (req: Request, env: Env, ctx: ExecutionContext) =>
     oauthProvider.fetch(req, env as any, ctx),
   scheduled: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
+    if (!env.DB) {
+      console.error("Scheduled run skipped: DB binding is not configured");
+      return;
+    }
     ctx.waitUntil(runNightlyCompression(env, ctx));
     ctx.waitUntil(runGraphPass(env, ctx));
-    ctx.waitUntil(runScheduledIntegrationSync(env));
+    if (env.OAUTH_KV) {
+      ctx.waitUntil(runScheduledIntegrationSync(env));
+    }
   },
 };

@@ -1,10 +1,16 @@
 .DS_Store
 assets/*.gif
 node_modules/
+dist/
 coverage/
 .wrangler/
 docs/
 .claude/
 .dev.vars
+.dev.vars.*
+!.dev.vars.example
 .env
+.env.local
+.env.*.local
+!.env.example
 worker-configuration.d.ts

@@ -44,7 +44,8 @@ async function main() {
   const body = content.length > 2000 ? content.slice(0, 2000) + '...' : content;
 
   try {
-    await fetch(`${baseUrl}/capture`, {
+    const captureUrl = new URL('/capture', baseUrl).toString();
+    await fetch(captureUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
